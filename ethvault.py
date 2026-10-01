@@ -51,11 +51,24 @@ try:
 except ImportError:
     HAS_CAM = False
 
+try:                                 # QR from screenshots / screen grab (no camera needed)
+    from PIL import Image as _PILImage, ImageGrab as _ImageGrab
+    from pyzbar import pyzbar as _pz
+    HAS_IMGQR = True
+except Exception:
+    HAS_IMGQR = False
+
 try:
     import evur                      # EIP-4527 / Uniform Resources helpers (evur.py next to this file)
     HAS_UR = True
 except Exception:
     HAS_UR = False
+
+try:
+    import keystone                  # Keystone coordinator support (keystone.py next to this file)
+    HAS_KS = HAS_UR
+except Exception:
+    HAS_KS = False
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -171,11 +184,11 @@ class ETHVaultApp:
         self.nb.pack(fill="both", expand=True, padx=8, pady=8)
         self.tabs = {}
         for name in ("1. Create Wallet (OFFLINE)", "2. Build Unsigned Tx", "3. Sign Tx (OFFLINE)",
-                     "4. Broadcast", "5. Watch Address", "6. Pair (EIP-4527)"):
+                     "4. Broadcast", "5. Watch Address", "6. Pair (EIP-4527)", "7. Keystone (ONLINE)"):
             f = ttk.Frame(self.nb); self.nb.add(f, text=name); self.tabs[name] = f
 
         self._build_create_tab(); self._build_tab(); self._sign_tab()
-        self._broadcast_tab(); self._watch_tab(); self._pair_tab()
+        self._broadcast_tab(); self._watch_tab(); self._pair_tab(); self._keystone_tab()
 
     # --------------------------- helpers --------------------------------
     def set_status(self, msg): self.status.config(text=msg)
@@ -529,6 +542,9 @@ class ETHVaultApp:
         ttk.Button(f, text="Load from file", command=self.sign_load_file).grid(row=3, column=0, sticky="w", padx=10)
         ttk.Button(f, text="Scan QR with camera", command=lambda: self.scan_qr_dialog(self.s_payload_qr)
                    ).grid(row=3, column=1, sticky="w", padx=10)
+        bf = ttk.Frame(f); bf.grid(row=3, column=2, sticky="w", padx=10)
+        ttk.Button(bf, text="Load QR image(s)…", command=self.sign_load_qr_images).pack(side="left")
+        ttk.Button(bf, text="Scan QR from screen", command=self.sign_scan_screen).pack(side="left", padx=6)
 
         ttk.Label(f, text="Keystore file:").grid(row=4, column=0, sticky="w", padx=10, pady=(10, 0))
         self.s_ks_path = ttk.Entry(f)
@@ -546,6 +562,85 @@ class ETHVaultApp:
     def s_payload_qr(self, text):
         self.s_payload.delete("1.0", "end"); self.s_payload.insert("1.0", text.strip())
         self.set_status("Payload scanned.")
+
+    # ---- QR from screenshots / screen (for PCs without a camera) ----
+    @staticmethod
+    def _qr_texts(img):
+        return [d.data.decode("utf-8", "ignore") for d in _pz.decode(img)]
+
+    def _feed_ur(self, urdec, texts):
+        """Feed decoded QR strings into a URDecoder. Returns True when the UR is complete."""
+        for t in texts:
+            t = t.strip()
+            if t[:3].lower() == "ur:":
+                if urdec.add(t): return True
+            elif t.startswith(("EVU1:", "EVS1:")):
+                self.s_payload_qr(t); return None
+        return False
+
+    def sign_load_qr_images(self):
+        if not (HAS_IMGQR and HAS_UR):
+            return messagebox.showinfo("QR from image", "Install:  pip install pyzbar pillow cbor2 rlp")
+        paths = filedialog.askopenfilenames(title="Select QR screenshot(s) — all frames if it was animated",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All", "*.*")])
+        if not paths: return
+        urdec = evur.URDecoder()
+        try:
+            for pth in paths:
+                r = self._feed_ur(urdec, self._qr_texts(_PILImage.open(pth).convert("RGB")))
+                if r is None: return
+                if r: break
+        except Exception as e:
+            return messagebox.showerror("QR from image", str(e))
+        if urdec.done:
+            t, body = urdec.result()
+            self.s_payload_qr(evur.ur_encode_single(t, body))
+        else:
+            n, tot = urdec.progress()
+            messagebox.showwarning("QR from image",
+                f"Incomplete: got {n}/{tot or '?'} fragments." if tot else
+                "No readable QR found. Crop tighter / make the QR bigger and try again.\n"
+                "If MetaMask's QR was animated, select screenshots of ALL its frames at once, "
+                "or use 'Scan QR from screen'.")
+
+    def sign_scan_screen(self):
+        """Grabs the screen ~7x/second and decodes any QR on it (works with animated MetaMask QR)."""
+        if not (HAS_IMGQR and HAS_UR):
+            return messagebox.showinfo("Scan from screen", "Install:  pip install pyzbar pillow cbor2 rlp")
+        win = tk.Toplevel(self.root); win.title("Scan QR from screen"); win.geometry("340x110")
+        win.attributes("-topmost", True)
+        info = tk.Label(win, text="Show MetaMask's QR on screen\n(don't cover it with this window)", justify="left")
+        info.pack(padx=10, pady=8)
+        tk.Button(win, text="Cancel", command=win.destroy).pack()
+        urdec = evur.URDecoder(); q = queue.Queue()
+        def grab():
+            while win.winfo_exists():
+                try:
+                    img = _ImageGrab.grab(all_screens=True).convert("RGB")
+                    q.put(("codes", self._qr_texts(img)))
+                except Exception as e:
+                    q.put(("err", str(e)))
+                time.sleep(0.15)
+        def poll():
+            if not win.winfo_exists(): return
+            try:
+                while True:
+                    kind, item = q.get_nowait()
+                    if kind == "err": info.config(text=f"Error: {item}"); continue
+                    try:
+                        r = self._feed_ur(urdec, item)
+                    except Exception as e:
+                        info.config(text=f"UR: {e}"); continue
+                    if r is None: win.destroy(); return
+                    if r:
+                        t, body = urdec.result(); win.destroy()
+                        self.s_payload_qr(evur.ur_encode_single(t, body)); return
+                    if item:
+                        n, tot = urdec.progress(); info.config(text=f"UR fragments: {n}/{tot}")
+            except queue.Empty:
+                pass
+            self.root.after(100, poll)
+        threading.Thread(target=grab, daemon=True).start(); poll()
 
     def sign_load_file(self):
         p = filedialog.askopenfilename(filetypes=[("Payload", "*.evu.txt *.txt"), ("All", "*.*")])
@@ -566,15 +661,20 @@ class ETHVaultApp:
             return messagebox.showerror("EIP-4527 request error", str(e))
         net = next((n for n, v in NETWORKS.items() if v["chain_id"] == tx["chainId"]), None)
         data = tx.get("data", "0x")
+        if tx.get("type") == 0:                                  # legacy (EIP-155)
+            fee_lines = (f"Gas price: {tx['gasPrice']/GWEI:.2f} gwei  (legacy transaction)\n"
+                         f"Max cost: {to_eth(tx['value'] + tx['gas']*tx['gasPrice'])} ETH\n")
+        else:                                                    # EIP-1559
+            fee_lines = (f"Max fee : {tx['maxFeePerGas']/GWEI:.2f} gwei  (tip {tx['maxPriorityFeePerGas']/GWEI:.2f})\n"
+                         f"Max cost: {to_eth(tx['value'] + tx['gas']*tx['maxFeePerGas'])} ETH\n")
         review = ("EIP-4527 request from: " + str(rq.get("origin") or "unknown app") + "\n"
                   "Please verify EVERY line before signing:\n\n"
                   f"Network : {net or 'UNKNOWN network'}  (chainId {tx['chainId']})\n"
                   f"From    : {('0x' + bytes(rq['address']).hex()) if rq.get('address') else '(this keystore)'}\n"
-                  f"To      : {tx['to']}\n"
+                  f"To      : {tx['to'] or '(CONTRACT CREATION)'}\n"
                   f"Amount  : {to_eth(tx['value'])} ETH\n"
                   f"Nonce   : {tx['nonce']}   Gas: {tx['gas']}\n"
-                  f"Max fee : {tx['maxFeePerGas']/GWEI:.2f} gwei  (tip {tx['maxPriorityFeePerGas']/GWEI:.2f})\n"
-                  f"Max cost: {to_eth(tx['value'] + tx['gas']*tx['maxFeePerGas'])} ETH\n"
+                  + fee_lines +
                   f"Data    : {data[:80]}{'  <-- CONTRACT CALL' if data not in ('0x', '') else ''}\n")
         if not net:
             review += "\nWARNING: this chainId is not a network ETHVault knows.\n"
@@ -755,10 +855,20 @@ class ETHVaultApp:
         self.p_seed = tk.Text(f, height=3, width=70); self.p_seed.grid(row=1, column=1, sticky="we", padx=8, pady=4)
         ttk.Label(f, text="BIP-39 passphrase (optional):").grid(row=2, column=0, sticky="e", padx=8)
         self.p_pass = ttk.Entry(f, show="*"); self.p_pass.grid(row=2, column=1, sticky="we", padx=8, pady=4)
-        ttk.Button(f, text="Show pairing QR (crypto-hdkey)", command=self.pair_show
-                   ).grid(row=3, column=1, sticky="w", padx=8, pady=8)
-        self.p_out = tk.Text(f, height=12); self.p_out.grid(row=4, column=0, columnspan=2, padx=10, pady=8, sticky="nsew")
-        f.columnconfigure(1, weight=1); f.rowconfigure(4, weight=1)
+        # (label, UR type, payload profile, QR fragment size)
+        self.p_choices = [
+            ("Keystone Nexus app   (crypto-multi-accounts)",        "multi", "nexus",   100),
+            ("OKX / Bitget         (crypto-multi-accounts, classic)", "multi", "classic", 200),
+            ("MetaMask             (crypto-hdkey)",                  "hdkey", "nexus",   100),
+            ("Rabby                (crypto-hdkey, classic)",         "hdkey", "classic", 200),
+        ]
+        self.p_kind = ttk.Combobox(f, state="readonly", width=52, values=[c[0] for c in self.p_choices])
+        self.p_kind.current(0); self.p_kind.grid(row=3, column=1, sticky="w", padx=8, pady=4)
+        ttk.Label(f, text="Pair with:").grid(row=3, column=0, sticky="e", padx=8)
+        ttk.Button(f, text="Show pairing QR", command=self.pair_show
+                   ).grid(row=4, column=1, sticky="w", padx=8, pady=8)
+        self.p_out = tk.Text(f, height=12); self.p_out.grid(row=5, column=0, columnspan=2, padx=10, pady=8, sticky="nsew")
+        f.columnconfigure(1, weight=1); f.rowconfigure(5, weight=1)
 
     def pair_show(self):
         if not OFFLINE:
@@ -769,10 +879,16 @@ class ETHVaultApp:
         words = " ".join(self.p_seed.get("1.0", "end").split()); pw = self.p_pass.get()
         if len(words.split()) not in (12, 15, 18, 21, 24):
             return messagebox.showerror("Seed", "Enter a valid 12/15/18/21/24-word seed phrase.")
+        _label, kind, profile, frag = self.p_choices[self.p_kind.current()]
         def work():
             x = evur.derive_account_xpub(words, pw)
             addr = Account.from_mnemonic(words, passphrase=pw).address
-            return evur.ur_encode_frames("crypto-hdkey", evur.hdkey_cbor(x), 200), addr, x["master_fp"].hex()
+            if kind == "multi":
+                frames = evur.ur_encode_frames("crypto-multi-accounts",
+                                               evur.multi_accounts_cbor(x, profile=profile), frag)
+            else:
+                frames = evur.ur_encode_frames("crypto-hdkey", evur.hdkey_cbor(x, profile=profile), frag)
+            return frames, addr, x["master_fp"].hex()
         def done(res, err):
             if err: return messagebox.showerror("Error", str(err))
             frames, addr, xfp = res
@@ -780,10 +896,98 @@ class ETHVaultApp:
             self.p_out.delete("1.0", "end")
             self.p_out.insert("1.0", f"First account (m/44'/60'/0'/0/0): {addr}\nMaster fingerprint: {xfp}\n\n"
                 "Compare that address with your keystore's address BEFORE pairing.\n"
-                "Then in MetaMask: Add account or hardware wallet -> QR-based -> scan the QR.\n"
-                "Later, MetaMask shows a request QR: load it in tab 3 (camera) and sign.")
-            self.show_qr_window(frames[0], "PAIRING QR → scan with MetaMask / EIP-4527 app", frames=frames)
+                "Pick the entry that matches the wallet you are pairing with, then scan this QR:\n"
+                "  Keystone Nexus -> Connect | OKX / Bitget -> Keystone | MetaMask -> QR-based | Rabby -> Keystone.\n"
+                "If one entry is rejected, try the other entry of the same wallet family.\n"
+                "Later the app shows a request QR: scan it in tab 3 (camera), sign, and show the signature QR back.")
+            self.show_qr_window(frames[0], "PAIRING QR → scan with your wallet app", frames=frames)
         self.async_do(work, done)
+
+    # ------------------------- TAB 7: KEYSTONE (coordinator) ---------------
+    def _keystone_tab(self):
+        f = self.tabs["7. Keystone (ONLINE)"]
+        self.ks_hd, self.ks_idx = (keystone.load_pairing() if HAS_KS else (None, 0))
+        self.ks_req = None
+        ttk.Label(f, justify="left", text=(
+            "ONLINE step — use a Keystone hardware wallet (EIP-4527 QR) as the signer.\n"
+            "1) On Keystone: Connect Software Wallet -> MetaMask, then scan its QR here.   "
+            "2) Fill tab 2 (From = paired address), then press 'Sign with Keystone'.   "
+            "3) Scan the signature QR the Keystone shows; the signed tx lands in tab 4.")
+            ).grid(row=0, column=0, columnspan=4, sticky="w", padx=10, pady=8)
+        if not HAS_KS:
+            ttk.Label(f, foreground="#a00", text="Keystone support unavailable: pip install cbor2 rlp, and keep "
+                      "keystone.py + evur.py + ur.py next to ethvault.py.").grid(row=1, column=0, columnspan=4, padx=10)
+            return
+        ttk.Button(f, text="1. Scan Keystone pairing QR", command=lambda: self.scan_qr_dialog(self.ks_pair)
+                   ).grid(row=1, column=0, sticky="w", padx=10, pady=4)
+        ttk.Button(f, text="Paste UR text…", command=self.ks_paste_pair).grid(row=1, column=1, sticky="w", padx=4)
+        ttk.Label(f, text="Address index:").grid(row=2, column=0, sticky="e", padx=6)
+        self.ks_addr = ttk.Combobox(f, state="readonly", width=48); self.ks_addr.grid(row=2, column=1, columnspan=2, sticky="w", padx=6, pady=4)
+        self.ks_addr.bind("<<ComboboxSelected>>", lambda e: self.ks_choose())
+        ttk.Button(f, text="2. Sign with Keystone  →  QR", command=self.ks_sign).grid(row=3, column=0, sticky="w", padx=10, pady=6)
+        ttk.Button(f, text="3. Scan signature QR", command=lambda: self.scan_qr_dialog(self.ks_signature)
+                   ).grid(row=3, column=1, sticky="w", padx=4)
+        ttk.Button(f, text="Paste signature UR…", command=self.ks_paste_sig).grid(row=3, column=2, sticky="w", padx=4)
+        self.ks_out = tk.Text(f, height=16); self.ks_out.grid(row=4, column=0, columnspan=4, padx=10, pady=8, sticky="nsew")
+        f.columnconfigure(3, weight=1); f.rowconfigure(4, weight=1)
+        if self.ks_hd: self._ks_refresh()
+
+    def _ks_refresh(self):
+        addrs = keystone.derive_addresses(self.ks_hd, 5)
+        self.ks_addr["values"] = [f"[{i}] {a}" for i, a in enumerate(addrs)]
+        self.ks_idx = min(self.ks_idx, len(addrs) - 1); self.ks_addr.current(self.ks_idx)
+        self.ks_out.delete("1.0", "end")
+        self.ks_out.insert("1.0", f"Paired Keystone\nFingerprint: {self.ks_hd['xfp']}\nPath: {self.ks_hd['path']}\n"
+                                  f"Device: {self.ks_hd.get('name') or self.ks_hd.get('source') or '—'}\n")
+        self.b_from.delete(0, "end"); self.b_from.insert(0, addrs[self.ks_idx])
+
+    def ks_choose(self):
+        self.ks_idx = self.ks_addr.current(); keystone.save_pairing(self.ks_hd, self.ks_idx); self._ks_refresh()
+
+    def ks_pair(self, text):
+        try:
+            self.ks_hd = keystone.parse_pairing_ur(text); self.ks_idx = 0
+            keystone.save_pairing(self.ks_hd, 0); self._ks_refresh()
+        except Exception as e:
+            messagebox.showerror("Keystone pairing", str(e))
+
+    def ks_paste_pair(self): self._ks_ask("Paste ur:crypto-hdkey text", self.ks_pair)
+    def ks_paste_sig(self):  self._ks_ask("Paste ur:eth-signature text", self.ks_signature)
+
+    def _ks_ask(self, title, cb):
+        w = tk.Toplevel(self.root); w.title(title)
+        t = tk.Text(w, height=8, width=70); t.pack(padx=8, pady=8)
+        tk.Button(w, text="OK", command=lambda: (cb(t.get("1.0", "end").strip()), w.destroy())).pack(pady=4)
+
+    def ks_sign(self):
+        if not self.ks_hd:
+            return messagebox.showerror("Keystone", "Pair the Keystone first (step 1).")
+        try:
+            frm, to, tx = self._collect_unsigned_tx()
+        except Exception as e:
+            return messagebox.showerror("Build error", f"Fill in tab 2 first.\n{e}")
+        want = keystone.derive_addresses(self.ks_hd, 5)[self.ks_idx]
+        if frm.lower() != want.lower():
+            return messagebox.showerror("Wrong 'From'", f"Tab 2 From is {frm}\nbut the paired Keystone address is {want}.")
+        rid, _, frames = keystone.build_sign_request(tx, self.ks_hd, self.ks_idx, want)
+        self.ks_req = (rid, tx, want)
+        self.ks_out.insert("end", f"\nRequest sent: {to_eth(tx['value'])} ETH -> {to}  (nonce {tx['nonce']}, chainId {tx['chainId']})\n"
+                                  "Show this QR to the Keystone, approve there, then press 'Scan signature QR'.\n")
+        self.show_qr_window(frames[0], "SIGN REQUEST → scan with Keystone", frames=frames)
+
+    def ks_signature(self, text):
+        if not self.ks_req:
+            return messagebox.showerror("Keystone", "No pending request. Press 'Sign with Keystone' first.")
+        rid, tx, want = self.ks_req
+        try:
+            raw = keystone.finish_signature(text, rid, tx, want)
+        except Exception as e:
+            return messagebox.showerror("Keystone signature", str(e))
+        out = pack("EVS1:", {"raw": raw, "tx": tx, "network": self.b_net.get(), "signer": want,
+                             "signed_at": datetime.now().isoformat(timespec="seconds")})
+        self.ks_out.insert("end", f"\nSIGNED ✔ by Keystone, signer verified: {want}\nPayload loaded into tab 4 — press BROADCAST.\n")
+        self.br_payload.delete("1.0", "end"); self.br_payload.insert("1.0", out)
+        self.nb.select(self.tabs["4. Broadcast"]); self.ks_req = None
 
 # -------------------------------- self test ----------------------------------
 def selftest():
