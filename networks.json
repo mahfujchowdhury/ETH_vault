@@ -1,0 +1,3 @@
+{
+  "Gnosis": {"chain_id": 100, "symbol": "xDAI", "rpc": "https://rpc.gnosischain.com", "testnet": false, "min_tip_gwei": 1}
+}

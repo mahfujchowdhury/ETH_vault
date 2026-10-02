@@ -77,11 +77,102 @@ from tkinter import ttk, messagebox, filedialog
 GWEI = 10**9
 WEI  = 10**18
 
+# symbol = native coin shown in every review screen; testnet=True turns off the "REAL FUNDS" warning;
+# min_tip_gwei = floor for the priority fee (some chains reject lower values).
 NETWORKS = {
-    "Ethereum Mainnet": {"chain_id": 1,        "rpc": "https://ethereum-rpc.publicnode.com"},
-    "Sepolia Testnet":  {"chain_id": 11155111, "rpc": "https://ethereum-sepolia-rpc.publicnode.com"},
-    "Holesky Testnet":  {"chain_id": 17000,    "rpc": "https://ethereum-holesky-rpc.publicnode.com"},
+    "Ethereum Mainnet":  {"chain_id": 1,        "symbol": "ETH",  "testnet": False, "min_tip_gwei": 1,
+                          "rpc": "https://ethereum-rpc.publicnode.com"},
+    "BNB Smart Chain":   {"chain_id": 56,       "symbol": "BNB",  "testnet": False, "min_tip_gwei": 0.05,
+                          "rpc": "https://bsc-rpc.publicnode.com"},
+    "Polygon PoS":       {"chain_id": 137,      "symbol": "POL",  "testnet": False, "min_tip_gwei": 25,
+                          "rpc": "https://polygon-bor-rpc.publicnode.com"},
+    "Arbitrum One":      {"chain_id": 42161,    "symbol": "ETH",  "testnet": False, "min_tip_gwei": 0,
+                          "rpc": "https://arbitrum-one-rpc.publicnode.com"},
+    "Optimism":          {"chain_id": 10,       "symbol": "ETH",  "testnet": False, "min_tip_gwei": 0.001,
+                          "rpc": "https://optimism-rpc.publicnode.com"},
+    "Base":              {"chain_id": 8453,     "symbol": "ETH",  "testnet": False, "min_tip_gwei": 0.001,
+                          "rpc": "https://base-rpc.publicnode.com"},
+    "Avalanche C-Chain": {"chain_id": 43114,    "symbol": "AVAX", "testnet": False, "min_tip_gwei": 1,
+                          "rpc": "https://avalanche-c-chain-rpc.publicnode.com"},
+    "Sepolia Testnet":   {"chain_id": 11155111, "symbol": "ETH",  "testnet": True,  "min_tip_gwei": 1,
+                          "rpc": "https://ethereum-sepolia-rpc.publicnode.com"},
+    "Holesky Testnet":   {"chain_id": 17000,    "symbol": "ETH",  "testnet": True,  "min_tip_gwei": 1,
+                          "rpc": "https://ethereum-holesky-rpc.publicnode.com"},
 }
+
+def _load_user_networks():
+    """Optional networks.json next to this file adds/overrides networks, e.g.
+    {"Gnosis": {"chain_id": 100, "symbol": "xDAI", "rpc": "https://rpc.gnosischain.com", "testnet": false}}
+    Keep the SAME file on the online and the offline machine so both name the chain/coin identically."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "networks.json")
+    if not os.path.exists(path): return
+    try:
+        extra, ok = json.load(open(path)), {}
+        for name, v in extra.items():
+            cid = int(v["chain_id"]); rpc_url = str(v["rpc"]); sym = str(v["symbol"])[:8]
+            if cid <= 0 or not rpc_url.startswith("https://") or not sym: raise ValueError(f"bad entry '{name}'")
+            ok[str(name)] = {"chain_id": cid, "rpc": rpc_url, "symbol": sym,
+                             "testnet": bool(v.get("testnet", False)),
+                             "min_tip_gwei": float(v.get("min_tip_gwei", 1))}
+        NETWORKS.update(ok)                      # all-or-nothing
+    except Exception as e:
+        print(f"networks.json ignored: {e}", file=sys.stderr)
+_load_user_networks()
+
+def net_of(chain_id):
+    return next((n for n, v in NETWORKS.items() if v["chain_id"] == chain_id), None)
+def sym_for(chain_id) -> str:
+    n = net_of(chain_id); return NETWORKS[n]["symbol"] if n else "native coin"
+def is_real(chain_id) -> bool:
+    """True for mainnets AND for unknown chains (treat anything not known-testnet as real money)."""
+    n = net_of(chain_id); return not (n and NETWORKS[n].get("testnet"))
+def real_banner(chain_id) -> str:
+    return (f"*** REAL FUNDS — {net_of(chain_id) or 'UNKNOWN NETWORK'} (chainId {chain_id}) ***\n\n"
+            if is_real(chain_id) else "")
+# Well-known stablecoins: (chain_id, contract lowercase) -> (symbol, decimals). NOTE: USDT/USDC have 18 decimals on BNB Chain
+# but 6 on Ethereum. Anything not listed is shown as UNKNOWN with raw units — verify the contract on the explorer.
+KNOWN_TOKENS = {
+    (1,  "0xdac17f958d2ee523a2206206994597c13d831ec7"): ("USDT", 6),
+    (1,  "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"): ("USDC", 6),
+    (56, "0x55d398326f99059ff775485246999027b3197955"): ("USDT", 18),
+    (56, "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d"): ("USDC", 18),
+}
+
+def describe_calldata(chain_id, to, data) -> str:
+    """Human-readable decode of ERC-20 transfer / approve / transferFrom so the token, recipient and amount
+    are visible BEFORE signing (the wallet's hex blob hides all three)."""
+    try:
+        from eth_utils import to_checksum_address
+        raw = bytes.fromhex((data or "0x")[2:])
+        if len(raw) < 4 or not to: return ""
+        sel, body = raw[:4].hex(), raw[4:]
+        kinds = {"a9059cbb": ("TRANSFER", 2), "095ea7b3": ("APPROVE spending of", 2), "23b872dd": ("TRANSFER-FROM", 3)}
+        if sel not in kinds: return "Call    : unrecognised contract method 0x" + sel + " — cannot show what it does\n"
+        name, nwords = kinds[sel]
+        if len(body) != 32 * nwords: return "Call    : malformed token call — DO NOT SIGN\n"
+        w = [body[i:i + 32] for i in range(0, len(body), 32)]
+        addr = lambda x: to_checksum_address("0x" + x[12:].hex())
+        amount = int.from_bytes(w[-1], "big")
+        tok = KNOWN_TOKENS.get((chain_id, to.lower()))
+        if tok:
+            sym, dec = tok; amt = f"{(Decimal(amount) / Decimal(10) ** dec).normalize():f} {sym}"
+            who = f"Token   : {sym} (known contract, {dec} decimals) {to}\n"
+        else:
+            amt = f"{amount} raw units (decimals unknown)"
+            who = f"Token   : UNKNOWN token contract {to} — verify it on the block explorer!\n"
+        if sel == "a9059cbb":   line = f"Action  : {name} {amt}\nTo      : {addr(w[0])}   <-- the real recipient\n"
+        elif sel == "095ea7b3":
+            unl = "   *** UNLIMITED allowance ***" if amount >= 2**255 else ""
+            line = f"Action  : {name} {amt} by {addr(w[0])}{unl}\n"
+        else:                   line = f"Action  : {name} {amt}\nFrom    : {addr(w[0])}\nTo      : {addr(w[1])}\n"
+        return who + line
+    except Exception as e:
+        return f"Call    : could not decode ({e})\n"
+
+def gwei_str(wei) -> str:
+    t = f"{Decimal(wei) / Decimal(GWEI):.4f}".rstrip("0").rstrip(".")
+    return t or "0"
+
 DEFAULT_NET = "Sepolia Testnet"
 FRAME_CHUNK = 700   # chars per animated QR frame
 
@@ -120,20 +211,27 @@ def rpc(url: str, method: str, params: list, timeout=20):
     return data["result"]
 
 def rpc_balance(url, addr):     return int(rpc(url, "eth_getBalance", [addr, "latest"]), 16)
-def rpc_nonce(url, addr):       return int(rpc(url, "eth_getTransactionCount", [addr, "latest"]), 16)
+def rpc_nonce(url, addr):       return int(rpc(url, "eth_getTransactionCount", [addr, "pending"]), 16)  # pending: no clash with queued txs
+def rpc_gas_price(url):         return int(rpc(url, "eth_gasPrice", []), 16)
 def rpc_chain_id(url):          return int(rpc(url, "eth_chainId", []), 16)
 def rpc_base_fee(url):
     blk = rpc(url, "eth_getBlockByNumber", ["latest", False])
     return int(blk.get("baseFeePerGas", "0x3b9aca00"), 16)
-def rpc_tip(url):
+def rpc_tip(url, floor_wei=GWEI):
     try:    tip = int(rpc(url, "eth_maxPriorityFeePerGas", []), 16)
     except Exception: tip = 0
-    return max(tip, GWEI)  # never below 1 gwei (some nodes return 0 -> "gas tip cap 0, minimum needed 1")
+    return max(tip, floor_wei)  # per-network floor (some nodes return 0 -> "gas tip cap 0, minimum needed 1")
 def rpc_estimate_gas(url, frm, to, value_wei, data="0x"):
     p = {"to": to, "value": hex(value_wei), "data": data or "0x"}
     if frm: p["from"] = frm
-    try:    return int(rpc(url, "eth_estimateGas", [p]), 16)
-    except Exception: return 21000
+    has_data = (data or "0x") not in ("0x", "")
+    try:
+        g = int(rpc(url, "eth_estimateGas", [p]), 16)
+    except Exception as e:
+        if has_data:   # a failed estimate on a contract call usually means it would revert — never guess 21000
+            raise RuntimeError(f"Gas estimation failed for this contract call ({e}). It would probably revert.")
+        return 21000
+    return g * 12 // 10 if has_data else g          # +20 % headroom on contract calls
 def rpc_broadcast(url, raw):    return rpc(url, "eth_sendRawTransaction", [raw])
 def rpc_receipt(url, txh):      return rpc(url, "eth_getTransactionReceipt", [txh])
 
@@ -424,7 +522,7 @@ class ETHVaultApp:
         self.b_rpc = ttk.Entry(f); self.b_rpc.insert(0, NETWORKS[DEFAULT_NET]["rpc"])
         self.b_rpc.grid(row=r, column=3, sticky="we", padx=6, pady=3)
         self.b_net.bind("<<ComboboxSelected>>", lambda e: (self.b_rpc.delete(0, "end"),
-                        self.b_rpc.insert(0, NETWORKS[self.b_net.get()]["rpc"])))
+                        self.b_rpc.insert(0, NETWORKS[self.b_net.get()]["rpc"]), self._net_changed()))
         r += 1
 
         fields = [("From (your cold wallet address):", "b_from"), ("To address:", "b_to"),
@@ -432,9 +530,11 @@ class ETHVaultApp:
                   ("Max fee (gwei):", "b_maxfee"), ("Priority tip (gwei):", "b_tip"),
                   ("Gas limit:", "b_gas"), ("Data (hex, optional):", "b_data")]
         for label, attr in fields:
-            ttk.Label(f, text=label).grid(row=r, column=0, sticky="e", padx=6, pady=3)
+            lbl = ttk.Label(f, text=label); lbl.grid(row=r, column=0, sticky="e", padx=6, pady=3)
+            if attr == "b_amount": self.b_amt_lbl = lbl
             e = ttk.Entry(f); e.grid(row=r, column=1, columnspan=3, sticky="we", padx=6, pady=3)
             setattr(self, attr, e); r += 1
+        self._net_changed()
 
         ttk.Button(f, text="Fetch nonce / fees / gas from network",
                    command=self.fetch_tx_params).grid(row=r, column=1, sticky="w", padx=6, pady=6)
@@ -447,19 +547,31 @@ class ETHVaultApp:
                                                            padx=10, pady=8, sticky="nsew")
         f.columnconfigure(3, weight=1); f.rowconfigure(r, weight=1)
 
+    def _net_sym(self) -> str:
+        return NETWORKS[self.b_net.get()]["symbol"]
+
+    def _net_changed(self):
+        self.b_amt_lbl.config(text=f"Amount ({self._net_sym()}):")
+        if is_real(NETWORKS[self.b_net.get()]["chain_id"]):
+            self.set_status(f"{self.b_net.get()}: REAL FUNDS network selected.")
+
     def fetch_tx_params(self):
         addr = self.b_from.get().strip()
         try: addr = checksum(addr)
         except Exception: return messagebox.showerror("Error", "Invalid 'From' address.")
         url = self.b_rpc.get().strip()
         to = self.b_to.get().strip()
+        floor = int(Decimal(str(NETWORKS[self.b_net.get()].get("min_tip_gwei", 1))) * GWEI)
+        data = self.b_data.get().strip() or "0x"
+        if not data.startswith("0x"): data = "0x" + data
         def work():
             nonce = rpc_nonce(url, addr)
-            base = rpc_base_fee(url); tip = rpc_tip(url)
-            maxfee = 2 * base + tip
+            base = rpc_base_fee(url); tip = rpc_tip(url, floor)
+            maxfee = max(2 * base + tip, rpc_gas_price(url))      # never below what the node says is the going price
+            tip = min(tip, maxfee)
             try: value = int(Decimal(self.b_amount.get()) * WEI)
             except Exception: value = 0
-            gas = rpc_estimate_gas(url, addr, checksum(to) if to else None, value) if to else 21000
+            gas = rpc_estimate_gas(url, addr, checksum(to) if to else None, value, data) if to else 21000
             cid = rpc_chain_id(url)
             return nonce, maxfee, tip, gas, cid, rpc_balance(url, addr)
         def done(res, err):
@@ -469,10 +581,10 @@ class ETHVaultApp:
             if exp and cid != exp:
                 messagebox.showwarning("Chain mismatch", f"RPC reports chainId {cid}, expected {exp}!")
             self.b_nonce.delete(0, "end");   self.b_nonce.insert(0, str(nonce))
-            self.b_maxfee.delete(0, "end");  self.b_maxfee.insert(0, f"{maxfee/GWEI:.2f}")
-            self.b_tip.delete(0, "end");     self.b_tip.insert(0, f"{tip/GWEI:.2f}")
+            self.b_maxfee.delete(0, "end");  self.b_maxfee.insert(0, gwei_str(maxfee))
+            self.b_tip.delete(0, "end");     self.b_tip.insert(0, gwei_str(tip))
             self.b_gas.delete(0, "end");     self.b_gas.insert(0, str(gas))
-            self.set_status(f"Fetched: nonce={nonce}  balance={to_eth(bal)} ETH  base-fee-based max fee={maxfee/GWEI:.2f} gwei")
+            self.set_status(f"Fetched: nonce={nonce}  balance={to_eth(bal)} {self._net_sym()}  max fee={gwei_str(maxfee)} gwei")
         self.async_do(work, done)
 
     def _collect_unsigned_tx(self):
@@ -502,13 +614,13 @@ class ETHVaultApp:
                "created": datetime.now().isoformat(timespec="seconds"),
                "max_fee_eth": to_eth(est_fee)}
         payload = pack("EVU1:", obj)
-        review = (f"UNSIGNED TRANSACTION (EIP-1559)\n"
+        review = (real_banner(tx["chainId"]) + f"UNSIGNED TRANSACTION (EIP-1559)\n"
                   f"Network : {obj['network']} (chainId {tx['chainId']})\n"
                   f"From    : {frm}\nTo      : {to}\n"
-                  f"Amount  : {to_eth(tx['value'])} ETH\n"
+                  f"Amount  : {to_eth(tx['value'])} {sym_for(tx['chainId'])}\n"
                   f"Nonce   : {tx['nonce']}    Gas: {tx['gas']}\n"
-                  f"Max fee : {tx['maxFeePerGas']/GWEI:.2f} gwei (tip {tx['maxPriorityFeePerGas']/GWEI:.2f})\n"
-                  f"Max cost: {to_eth(tx['value'] + est_fee)} ETH (incl. fees)\n"
+                  f"Max fee : {gwei_str(tx['maxFeePerGas'])} gwei (tip {gwei_str(tx['maxPriorityFeePerGas'])})\n"
+                  f"Max cost: {to_eth(tx['value'] + est_fee)} {sym_for(tx['chainId'])} (incl. fees)\n"
                   f"Payload : {len(payload)} chars (zlib-compressed)\n\n{payload}\n")
         return payload, review
 
@@ -659,23 +771,24 @@ class ETHVaultApp:
             rq, tx = evur.validate_sign_request(text)
         except Exception as e:
             return messagebox.showerror("EIP-4527 request error", str(e))
-        net = next((n for n, v in NETWORKS.items() if v["chain_id"] == tx["chainId"]), None)
+        net = net_of(tx["chainId"]); SYM = sym_for(tx["chainId"])
         data = tx.get("data", "0x")
         if tx.get("type") == 0:                                  # legacy (EIP-155)
-            fee_lines = (f"Gas price: {tx['gasPrice']/GWEI:.2f} gwei  (legacy transaction)\n"
-                         f"Max cost: {to_eth(tx['value'] + tx['gas']*tx['gasPrice'])} ETH\n")
+            fee_lines = (f"Gas price: {gwei_str(tx['gasPrice'])} gwei  (legacy transaction)\n"
+                         f"Max cost: {to_eth(tx['value'] + tx['gas']*tx['gasPrice'])} {SYM}\n")
         else:                                                    # EIP-1559
-            fee_lines = (f"Max fee : {tx['maxFeePerGas']/GWEI:.2f} gwei  (tip {tx['maxPriorityFeePerGas']/GWEI:.2f})\n"
-                         f"Max cost: {to_eth(tx['value'] + tx['gas']*tx['maxFeePerGas'])} ETH\n")
-        review = ("EIP-4527 request from: " + str(rq.get("origin") or "unknown app") + "\n"
+            fee_lines = (f"Max fee : {gwei_str(tx['maxFeePerGas'])} gwei  (tip {gwei_str(tx['maxPriorityFeePerGas'])})\n"
+                         f"Max cost: {to_eth(tx['value'] + tx['gas']*tx['maxFeePerGas'])} {SYM}\n")
+        review = (real_banner(tx["chainId"]) + "EIP-4527 request from: " + str(rq.get("origin") or "unknown app") + "\n"
                   "Please verify EVERY line before signing:\n\n"
                   f"Network : {net or 'UNKNOWN network'}  (chainId {tx['chainId']})\n"
                   f"From    : {('0x' + bytes(rq['address']).hex()) if rq.get('address') else '(this keystore)'}\n"
                   f"To      : {tx['to'] or '(CONTRACT CREATION)'}\n"
-                  f"Amount  : {to_eth(tx['value'])} ETH\n"
+                  f"Amount  : {to_eth(tx['value'])} {SYM}\n"
                   f"Nonce   : {tx['nonce']}   Gas: {tx['gas']}\n"
                   + fee_lines +
-                  f"Data    : {data[:80]}{'  <-- CONTRACT CALL' if data not in ('0x', '') else ''}\n")
+                  f"Data    : {data[:80]}{'  <-- CONTRACT CALL' if data not in ('0x', '') else ''}\n"
+                  + describe_calldata(tx["chainId"], tx["to"], data))
         if not net:
             review += "\nWARNING: this chainId is not a network ETHVault knows.\n"
         if not messagebox.askyesno("Confirm signing", review + "\nSign this transaction?"):
@@ -714,15 +827,17 @@ class ETHVaultApp:
         if pre != "EVU1:":
             return messagebox.showerror("Payload error", "This is not an UNSIGNED (EVU1) payload.")
         tx = obj["tx"]
-        review = ("Please verify EVERY line before signing:\n\n"
-                  f"Network : {obj.get('network')}  (chainId {tx['chainId']})\n"
+        SYM = sym_for(tx["chainId"])
+        review = (real_banner(tx["chainId"]) + "Please verify EVERY line before signing:\n\n"
+                  f"Network : {net_of(tx['chainId']) or 'UNKNOWN network'}  (chainId {tx['chainId']})\n"
                   f"From    : {obj.get('from')}\n"
                   f"To      : {tx['to']}\n"
-                  f"Amount  : {to_eth(tx['value'])} ETH\n"
+                  f"Amount  : {to_eth(tx['value'])} {SYM}\n"
                   f"Nonce   : {tx['nonce']}   Gas: {tx['gas']}\n"
-                  f"Max fee : {tx['maxFeePerGas']/GWEI:.2f} gwei  (tip {tx['maxPriorityFeePerGas']/GWEI:.2f})\n"
-                  f"Max cost: {to_eth(tx['value'] + tx['gas']*tx['maxFeePerGas'])} ETH\n"
-                  f"Data    : {tx.get('data', '0x')[:80]}\n")
+                  f"Max fee : {gwei_str(tx['maxFeePerGas'])} gwei  (tip {gwei_str(tx['maxPriorityFeePerGas'])})\n"
+                  f"Max cost: {to_eth(tx['value'] + tx['gas']*tx['maxFeePerGas'])} {SYM}\n"
+                  f"Data    : {tx.get('data', '0x')[:80]}\n"
+                  + describe_calldata(tx["chainId"], tx["to"], tx.get("data", "0x")))
         if not messagebox.askyesno("Confirm signing", review + "\nSign this transaction?"):
             return
         ks_path = self.s_ks_path.get().strip(); pw = self.s_pw.get()
@@ -790,11 +905,17 @@ class ETHVaultApp:
         signer = Account.recover_transaction(raw)
         url = self.b_rpc.get().strip() or NETWORKS[DEFAULT_NET]["rpc"]
         if not messagebox.askyesno("Confirm broadcast",
-                f"Broadcast to {obj.get('network')} via\n{url}\n\n"
-                f"To     : {tx['to']}\nAmount : {to_eth(tx['value'])} ETH\nNonce  : {tx['nonce']}\n"
+                real_banner(tx["chainId"]) +
+                f"Broadcast to {net_of(tx['chainId']) or obj.get('network')} via\n{url}\n\n"
+                f"To     : {tx['to']}\nAmount : {to_eth(tx['value'])} {sym_for(tx['chainId'])}\nNonce  : {tx['nonce']}\n"
                 f"Signer : {signer}\n\nProceed?"):
             return
         def work():
+            cid = rpc_chain_id(url)
+            if cid != tx["chainId"]:
+                raise RuntimeError(f"This RPC is chainId {cid} ({net_of(cid) or 'unknown'}) but the signed transaction is for "
+                                   f"chainId {tx['chainId']} ({net_of(tx['chainId']) or 'unknown'}). Nothing was sent.\n"
+                                   "Select the matching network in tab 2 (it fills in the RPC), then broadcast again.")
             txh = rpc_broadcast(url, raw)
             receipt = None
             for _ in range(20):
@@ -840,7 +961,7 @@ class ETHVaultApp:
             if err: return messagebox.showerror("Network error", str(err))
             bal, nonce = res
             self.w_out.delete("1.0", "end")
-            self.w_out.insert("1.0", f"Address : {addr}\nBalance : {to_eth(bal)} ETH\nNonce   : {nonce}\n")
+            self.w_out.insert("1.0", f"Address : {addr}\nBalance : {to_eth(bal)} {self._net_sym()}   ({self.b_net.get()})\nNonce   : {nonce}\n")
         self.async_do(work, done)
 
     # ------------------------- TAB 6: PAIR (EIP-4527) -----------------------
@@ -971,7 +1092,7 @@ class ETHVaultApp:
             return messagebox.showerror("Wrong 'From'", f"Tab 2 From is {frm}\nbut the paired Keystone address is {want}.")
         rid, _, frames = keystone.build_sign_request(tx, self.ks_hd, self.ks_idx, want)
         self.ks_req = (rid, tx, want)
-        self.ks_out.insert("end", f"\nRequest sent: {to_eth(tx['value'])} ETH -> {to}  (nonce {tx['nonce']}, chainId {tx['chainId']})\n"
+        self.ks_out.insert("end", f"\nRequest sent: {to_eth(tx['value'])} {sym_for(tx['chainId'])} -> {to}  (nonce {tx['nonce']}, chainId {tx['chainId']})\n"
                                   "Show this QR to the Keystone, approve there, then press 'Scan signature QR'.\n")
         self.show_qr_window(frames[0], "SIGN REQUEST → scan with Keystone", frames=frames)
 
